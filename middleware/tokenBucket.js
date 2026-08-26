@@ -1,20 +1,25 @@
 import path from "path"
 
-let BUCKET = [];
-const BUCKET_SIZE = 5;
-const OUTFLOW_RATE = 10000;
+const TIME_WINDOW_LENGTH = 10000;
+const MAX_REQ_ALLOWED = 3;
+let CURRENT_REQ_COUNT = 0;
+
 
 setInterval(()=>{
-    if(BUCKET.length > 0){
-        const {next} = BUCKET.shift();
-        next();
-    }
-},OUTFLOW_RATE)
+    CURRENT_REQ_COUNT = 0;
+    console.log("Refreshing Window....")
+}, TIME_WINDOW_LENGTH)
 
-export const checkBucket = (req,res,next)=>{
-    if(BUCKET.length < BUCKET_SIZE){
-        BUCKET.push({req, res, next});
-    }else{
-        res.sendFile(path.resolve('./public/err/rate-limited.html'))
+export const rateLimiter = (req,res,next)=>{
+    try{
+        if(CURRENT_REQ_COUNT < MAX_REQ_ALLOWED){
+            CURRENT_REQ_COUNT++;
+            console.log(`Request Counter : ${CURRENT_REQ_COUNT}`)
+            next();
+        }else{
+            res.sendFile(path.resolve("./public/err/rate-limited.html"))
+        }
+    }catch(err){
+        console.log(`Error in rateLimiter : ${err}`);
     }
 }
