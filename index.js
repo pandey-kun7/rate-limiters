@@ -28,7 +28,7 @@ app.listen(8000,()=>{
     console.log("\x1b[1m\x1b[36m═══════════════════════════════════════════════\x1b[0m\n");
 
 	function askChoiceForRateLimit(){
-		terminalInput.question("Which type of ratelimiter you wish to use ? \n Press 1 for Token Bucket \n Press 2 for Sliding Window Log \n Press 3 for Leaky Bucket \n Press 4 for Fixed Window Counter \n",(input)=>{
+		terminalInput.question("Which type of ratelimiter you wish to use ? \n Press 1 for Token Bucket \n Press 2 for Sliding Window Log \n Press 3 for Leaky Bucket \n Press 4 for Fixed Window Counter \n Press 5 for Sliding Window Counter \n",(input)=>{
 		choice = Number(input);
 
 		if(choice === 1){
@@ -39,6 +39,8 @@ app.listen(8000,()=>{
 			console.log("\n\x1b[1m\x1b[33m>> Leaky Bucket\x1b[0m selected");
 		}else if(choice === 4){
 			console.log("\n\x1b[1m\x1b[33m>> Fixed Window Counter\x1b[0m selected");
+		}else if(choice === 5){
+			console.log("\n\x1b[1m\x1b[33m>> Sliding Window Counter\x1b[0m selected");
 		}else{
 			console.log("\n\x1b[31m[!]\x1b[0m No rate limiter selected, requests will pass through");
 		}
