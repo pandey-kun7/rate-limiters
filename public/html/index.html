@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rate limiting testing</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+            background: #e9dcc8;
+            color: #1a1a1a;
+            padding: 20px;
+        }
+        .box {
+            background: #faf5eb;
+            border: 1px solid #d9c7a7;
+            border-radius: 12px;
+            padding: 32px;
+            width: 100%;
+            max-width: 380px;
+            text-align: center;
+            box-shadow: 0 2px 12px rgba(120, 90, 50, 0.12);
+        }
+        h1 { margin: 0 0 6px; font-size: 20px; }
+        p { margin: 0 0 20px; font-size: 13px; color: #6b7280; }
+        button {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 10px;
+            font-size: 14px;
+            font-weight: 600;
+            border-radius: 8px;
+            border: 1px solid #d1d5db;
+            background: #fffdf8;
+            cursor: pointer;
+            transition: background 0.15s ease, transform 0.05s ease;
+        }
+        button:hover { background: #f3e8d5; }
+        button:active { transform: scale(0.98); }
+        #priority { background: #111827; color: #fff; border-color: #111827; }
+        #priority:hover { background: #1f2937; }
+        #log {
+            margin: 14px 0 0;
+            padding: 0;
+            list-style: none;
+            text-align: left;
+            font-size: 12.5px;
+            max-height: 240px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        #log:empty::after {
+            content: "No responses yet — click a button above.";
+            display: block;
+            text-align: center;
+            color: #9ca3af;
+            border: 1px dashed #d9c7a7;
+            border-radius: 8px;
+            padding: 12px;
+        }
+        #log li {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0;
+            padding: 7px 10px;
+            background: #fffdf8;
+            border: 1px solid #e7d9bd;
+            border-radius: 8px;
+            color: #374151;
+        }
+        #log li .n {
+            flex-shrink: 0;
+            min-width: 30px;
+            text-align: center;
+            font-weight: 700;
+            font-size: 11px;
+            color: #fff;
+            background: #a08c6d;
+            border-radius: 999px;
+            padding: 2px 7px;
+        }
+        #log li .msg { flex: 1; overflow-wrap: anywhere; }
+        #log li .st {
+            flex-shrink: 0;
+            font-size: 10.5px;
+            font-weight: 700;
+            border-radius: 999px;
+            padding: 2px 8px;
+            border: 1px solid transparent;
+        }
+        #log li.ok { border-color: #b7d8bf; }
+        #log li.ok .n { background: #15803d; }
+        #log li.ok .st { color: #15803d; background: #e7f4ea; border-color: #b7d8bf; }
+        #log li.limited { border-color: #eec2c2; }
+        #log li.limited .n { background: #b91c1c; }
+        #log li.limited .st { color: #b91c1c; background: #fbe9e9; border-color: #eec2c2; }
+        #log li.sending .n { background: #a08c6d; }
+        #log li.sending .st { color: #6b7280; background: #f3e8d5; border-color: #e7d9bd; }
+        #log li.error { border-color: #ecd3a8; }
+        #log li.error .n { background: #b45309; }
+        #log li.error .st { color: #b45309; background: #fdf1dc; border-color: #ecd3a8; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>Rate limiting testing</h1>
+        <p>Send a normal or priority request to the API.</p>
+        <button id="normal">Normal Request</button>
+        <button id="priority">Priority Request</button>
+        <ol id="log" aria-live="polite"></ol>
+    </div>
+<script>
+const logEl = document.getElementById("log");
+const normalBtn = document.getElementById("normal");
+const priorityBtn = document.getElementById("priority");
+
+let serial = 0;
+
+function renderEntry(li, n, kind, text, badge) {
+    li.innerHTML = "";
+    const nEl = document.createElement("span");
+    nEl.className = "n";
+    nEl.textContent = "#" + n;
+    const msg = document.createElement("span");
+    msg.className = "msg";
+    msg.textContent = kind + " " + text;
+    const st = document.createElement("span");
+    st.className = "st";
+    st.textContent = badge;
+    li.append(nEl, msg, st);
+}
+
+function addEntry(kind) {
+    serial++;
+    const li = document.createElement("li");
+    li.className = "sending";
+    renderEntry(li, serial, kind, "sending...", "...");
+    logEl.appendChild(li);
+    li.scrollIntoView({ block: "nearest" });
+    return { li, n: serial };
+}
+
+async function sendRequest(kind) {
+    const isPriority = kind === "priority";
+    const path = isPriority ? "/api/priority" : "/api/normal";
+    const entry = addEntry(kind);
+    try {
+        const res = await fetch(path, {
+            headers: { "Priority": isPriority ? "1" : "0" }
+        });
+        const remaining = res.headers.get("X-Ratelimit-Remaining");
+        const suffix = remaining !== null ? " (left " + remaining + ")" : "";
+        if (res.ok) {
+            entry.li.className = "ok";
+            renderEntry(entry.li, entry.n, kind, "allowed" + suffix, String(res.status));
+        } else if (res.status === 429) {
+            entry.li.className = "limited";
+            renderEntry(entry.li, entry.n, kind, "limited" + suffix, "429");
+        } else {
+            entry.li.className = "error";
+            renderEntry(entry.li, entry.n, kind, "unexpected", String(res.status));
+        }
+    } catch (err) {
+        entry.li.className = "error";
+        renderEntry(entry.li, entry.n, kind, "failed", "ERR");
+        entry.li.title = String(err.message || err);
+    }
+}
+
+normalBtn.addEventListener("click", () => sendRequest("normal"));
+priorityBtn.addEventListener("click", () => sendRequest("priority"));
+</script>
+</body>
+</html>
