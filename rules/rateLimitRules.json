@@ -1,0 +1,42 @@
+[
+    {
+        "title" : "Token Bucket Rate Limit",
+        "type" : "tokenBucketRateLimit",
+        "rate-limit" : {
+            "unit" : 10000,
+            "requests_per_unit" : 3 
+        }
+    },
+    {
+        "title" : "Sliding Window Log Rate Limit",
+        "type" : "slidingWindowLogRateLimit",
+        "rate-limit" : {
+            "unit" : 10000,
+            "requests_per_unit" : 3 
+        }
+    },
+    {
+        "title" : "Leaky Bucket Rate Limit",
+        "type" : "leakyBucketRateLimit",
+        "rate-limit" : {
+            "unit" : 10000,
+            "requests_per_unit" : 1 
+        }
+    },
+    {
+        "title" : "Fixed Window Counter Rate Limit",
+        "type" : "fixedWindowCounterRateLimit",
+        "rate-limit" : {
+            "unit" : 10000,
+            "requests_per_unit" : 3 
+        }
+    },
+    {
+        "title" : "Sliding Window Counter Rate Limit",
+        "type" : "slidingWindowCounterRateLimit",
+        "rate-limit" : {
+            "unit" : 10000,
+            "requests_per_unit" : 3 
+        }
+    }
+]
