@@ -1,6 +1,5 @@
 import express from "express"
 import cors from "cors"
-import fs from "fs"
 import readline from "readline"
 import { ServeRouter } from "./routes/serve.route.js";
 
@@ -22,7 +21,6 @@ const terminalInput = readline.createInterface({
 	terminal : false
 })
 
-export const RULES = JSON.parse(fs.readFileSync("./rules/rateLimitRules.json"));
 
 app.listen(8000,()=>{
     console.log("\n\x1b[1m\x1b[36m═══════════════════════════════════════════════\x1b[0m");

@@ -1,5 +1,8 @@
 import path from "path"
-import {choice, RULES} from "../index.js"
+import fs from "fs"
+import {choice} from "../index.js"
+
+const RULES = JSON.parse(fs.readFileSync("./rules/rateLimitRules.json","utf-8"));
 
 const priorityReq = [];
 
@@ -9,17 +12,17 @@ const leakyBucketRateLimitIndex = 2;
 const fixedWindowCounterRateLimitIndex = 3;
 const slidingWindowCounterRateLimitIndex = 4;
 
-const BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["requests_per_unit"];
-const RATE_FILL = RULES[tokenBucketRateLimitIndex]["unit"];
-let CURR_BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["requests_per_unit"];
+const BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["rate-limit"]["requests_per_unit"];
+const RATE_FILL = RULES[tokenBucketRateLimitIndex]["rate-limit"]["unit"];
+let CURR_BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["rate-limit"]["requests_per_unit"];
 
 function tokenBucketRateLimit(req,res,next){
     try{
         if(CURR_BUCKET_SIZE > 0){
-            next();
-            CURR_BUCKET_SIZE--;
             res.setHeader('X-Ratelimit-Remaining', `${CURR_BUCKET_SIZE}`);
             res.setHeader('X-Ratelimit-Limit', `${BUCKET_SIZE}`);
+            CURR_BUCKET_SIZE--;
+            next();
             console.log(`\x1b[90m[Token Bucket]\x1b[0m Remaining tokens : \x1b[1m\x1b[33m${CURR_BUCKET_SIZE}\x1b[0m\x1b[90m / ${BUCKET_SIZE}\x1b[0m`);
         }else{
             if(req.get("Priority") && req.get("Priority") === "1"){
@@ -37,8 +40,8 @@ function tokenBucketRateLimit(req,res,next){
 }
 
 
-const SLIDING_WINDOW_LENGTH = RULES[slidingWindowLogRateLimitIndex]["unit"];;
-const MAX_REQ_ALLOWED = RULES[slidingWindowLogRateLimitIndex]["requests_per_unit"];
+const SLIDING_WINDOW_LENGTH = RULES[slidingWindowLogRateLimitIndex]["rate-limit"]["unit"];;
+const MAX_REQ_ALLOWED = RULES[slidingWindowLogRateLimitIndex]["rate-limit"]["requests_per_unit"];
 let REQUEST_TIME_STAMPS = [];
 
 function clear(timeStamp){
@@ -53,9 +56,9 @@ function slidingWindowLogRateLimit(req,res,next){
         clear(now);
         if(REQUEST_TIME_STAMPS.length < MAX_REQ_ALLOWED){
             REQUEST_TIME_STAMPS.push(now);
-            next();
             res.setHeader('X-Ratelimit-Remaining', `${MAX_REQ_ALLOWED - REQUEST_TIME_STAMPS.length}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_REQ_ALLOWED}`);
+            next();
             console.log(`\x1b[90m[Sliding Window]\x1b[0m Request allowed (\x1b[1m${REQUEST_TIME_STAMPS.length}\x1b[0m/\x1b[1m${MAX_REQ_ALLOWED}\x1b[0m)`);
         }else{
             if(req.get("Priority") && req.get("Priority") === "1"){
@@ -73,17 +76,21 @@ function slidingWindowLogRateLimit(req,res,next){
 
 
 let BUCKET = [];
+const LEAKY_BUCKET_SIZE = RULES[leakyBucketRateLimitIndex]["rate-limit"]['requests_per_unit'];
+const REFILL_TIME = RULES[leakyBucketRateLimitIndex]["rate-limit"]['unit']
 
 function leakyBucketRateLimit(req,res,next){
     try{
-        if(BUCKET.length < BUCKET_SIZE){
+        console.log(BUCKET.length ," ", LEAKY_BUCKET_SIZE)
+        if(BUCKET.length < LEAKY_BUCKET_SIZE){
             BUCKET.push({req,res,next});
-            console.log(`\x1b[90m[Leaky Bucket]\x1b[0m Request queued (\x1b[1m${BUCKET.length}\x1b[0m/\x1b[1m${BUCKET_SIZE}\x1b[0m)`);
+            console.log(`\x1b[90m[Leaky Bucket]\x1b[0m Request queued (\x1b[1m${BUCKET.length}\x1b[0m/\x1b[1m${LEAKY_BUCKET_SIZE}\x1b[0m)`);
         }else{
             if(req.get("Priority") && req.get("Priority") === "1"){
                 priorityReq.push({req,res,next});
                 return;
             }
+            res.setHeader('X-Ratelimit-Retry-After', `${REFILL_TIME/LEAKY_BUCKET_SIZE}`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log("\x1b[31m[Leaky Bucket]\x1b[0m Request rejected, bucket full");
         }
@@ -93,16 +100,16 @@ function leakyBucketRateLimit(req,res,next){
 }
 
 
-const MAX_REQUEST_ALLOWED = RULES[fixedWindowCounterRateLimitIndex]["requests_per_unit"];
+const MAX_REQUEST_ALLOWED = RULES[fixedWindowCounterRateLimitIndex]["rate-limit"]["requests_per_unit"];
 let CURR_REQ_COUNT = 0;
 
 function fixedWindowCounterRateLimit(req,res,next){
     try{
         if(CURR_REQ_COUNT < MAX_REQUEST_ALLOWED){
-            next();
             CURR_REQ_COUNT++;
             res.setHeader('X-Ratelimit-Remaining', `${MAX_REQUEST_ALLOWED - CURR_REQ_COUNT}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_REQUEST_ALLOWED}`);
+            next();
             console.log(`\x1b[90m[Fixed Window]\x1b[0m Request allowed (\x1b[1m${CURR_REQ_COUNT}\x1b[0m/\x1b[1m${MAX_REQUEST_ALLOWED}\x1b[0m)`);
         }else{
             if(req.get("Priority") && req.get("Priority") === "1"){
@@ -121,8 +128,8 @@ function fixedWindowCounterRateLimit(req,res,next){
 
 let PREV_WINDOW_REQ_COUNT = 0;
 let CURR_WINDOW_REQ_COUNT = 0;
-const MAX_WINDOW_REQ_ALLOWED = LES[slidingWindowCounterRateLimitIndex]["requests_per_unit"];
-const WINDOW_TIME_LIMIT = RULES[slidingWindowCounterRateLimitIndex]["unit"];
+const MAX_WINDOW_REQ_ALLOWED = RULES[slidingWindowCounterRateLimitIndex]["rate-limit"]["requests_per_unit"];
+const WINDOW_TIME_LIMIT = RULES[slidingWindowCounterRateLimitIndex]["rate-limit"]["unit"];
 let CURR_REQUEST_LIMIT = 0;
 let OLD_REQ_TIME_STAMP = 0;
 let CURR_REQ_TIME_STAMP = 0;
@@ -132,36 +139,36 @@ function slidingWindowCounterRateLimit(req,res,next){
         const now = Date.now();
         if(CURR_REQ_TIME_STAMP === 0 ){
             CURR_REQ_TIME_STAMP = now;
-            CURR_WINDOW_REQ_COUNT++;
-            next();
             res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
+            CURR_WINDOW_REQ_COUNT++;
+            next();
             console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m \x1b[32mInitializing window stamp\x1b[0m = \x1b[1m\x1b[33m${CURR_REQ_TIME_STAMP}\x1b[0m \x1b[90m(${new Date(CURR_REQ_TIME_STAMP).toLocaleTimeString()})\x1b[0m`);
             console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed — current req count : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m`);
         }else if(CURR_REQ_TIME_STAMP !==0 && now - WINDOW_TIME_LIMIT < CURR_REQ_TIME_STAMP && MAX_WINDOW_REQ_ALLOWED > CURR_WINDOW_REQ_COUNT && OLD_REQ_TIME_STAMP === 0){
-            CURR_WINDOW_REQ_COUNT++;
-            next();
             res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
+            CURR_WINDOW_REQ_COUNT++;
+            next();
             console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed — current req count : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(window stamp\x1b[0m \x1b[33m${CURR_REQ_TIME_STAMP}\x1b[0m\x1b[90m)\x1b[0m`);
         }else if(now - WINDOW_TIME_LIMIT >= CURR_REQ_TIME_STAMP){
             PREV_WINDOW_REQ_COUNT = CURR_WINDOW_REQ_COUNT;
             CURR_WINDOW_REQ_COUNT = 1;
             OLD_REQ_TIME_STAMP = CURR_REQ_TIME_STAMP;
             CURR_REQ_TIME_STAMP = now;
-            next();
             res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
+            next();
             console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m \x1b[32mRefreshing window stamp...\x1b[0m \x1b[90mold =\x1b[0m \x1b[1m\x1b[33m${OLD_REQ_TIME_STAMP}\x1b[0m \x1b[90m(${new Date(OLD_REQ_TIME_STAMP).toLocaleTimeString()})\x1b[0m \x1b[90m→ new =\x1b[0m \x1b[1m\x1b[33m${CURR_REQ_TIME_STAMP}\x1b[0m \x1b[90m(${new Date(CURR_REQ_TIME_STAMP).toLocaleTimeString()})\x1b[0m`);
             console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m \x1b[90mPrevious window req count : \x1b[0m\x1b[1m\x1b[33m${PREV_WINDOW_REQ_COUNT}\x1b[0m \x1b[90m| current window req count : \x1b[0m\x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m`);
         }else if(OLD_REQ_TIME_STAMP!==0){
             CURR_REQUEST_LIMIT = CURR_WINDOW_REQ_COUNT + Math.floor((PREV_WINDOW_REQ_COUNT * ( 1 -((now - CURR_REQ_TIME_STAMP) / WINDOW_TIME_LIMIT))));
             if(CURR_REQUEST_LIMIT < MAX_WINDOW_REQ_ALLOWED){
                 const before = CURR_WINDOW_REQ_COUNT;
-                CURR_WINDOW_REQ_COUNT++;
-                next();
                 res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
                 res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
+                CURR_WINDOW_REQ_COUNT++;
+                next();
                 console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed — current req limit : \x1b[1m\x1b[33m${CURR_REQUEST_LIMIT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(curr \x1b[0m\x1b[33m${before}\x1b[0m\x1b[90m + prev \x1b[0m\x1b[33m${PREV_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m weighted)\x1b[0m`);
             }else {
                 if(req.get("Priority") && req.get("Priority") === "1"){
@@ -201,10 +208,10 @@ setInterval(()=>{
         CURR_BUCKET_SIZE++;
         console.log("\x1b[90m[Token Bucket]\x1b[0m \x1b[32mAdding token...\x1b[0m new size : \x1b[1m"+CURR_BUCKET_SIZE+"\x1b[0m");
     }else if(choice === 3 && BUCKET.length > 0){
-        const {next} = BUCKET.shift();
+        const {next, res} = BUCKET.shift();
+        res.setHeader('X-Ratelimit-Remaining', `${LEAKY_BUCKET_SIZE - BUCKET.length}`);
+        res.setHeader('X-Ratelimit-Limit', `${LEAKY_BUCKET_SIZE}`);
         next();
-        res.setHeader('X-Ratelimit-Remaining', `${BUCKET_SIZE - BUCKET.length}`);
-        res.setHeader('X-Ratelimit-Limit', `${BUCKET_SIZE}`);
         console.log("\x1b[90m[Leaky Bucket]\x1b[0m \x1b[32mReading a queued request...\x1b[0m remaining : \x1b[1m"+BUCKET.length+"\x1b[0m");
     }else if(choice === 4 && CURR_REQ_COUNT>0){
         CURR_REQ_COUNT = 0;

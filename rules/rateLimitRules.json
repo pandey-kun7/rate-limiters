@@ -20,7 +20,7 @@
         "type" : "leakyBucketRateLimit",
         "rate-limit" : {
             "unit" : 10000,
-            "requests_per_unit" : 1 
+            "requests_per_unit" : 3
         }
     },
     {
