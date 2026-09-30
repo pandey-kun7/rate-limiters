@@ -11,7 +11,7 @@
         "title" : "Sliding Window Log Rate Limit",
         "type" : "slidingWindowLogRateLimit",
         "rate-limit" : {
-            "unit" : 10000,
+            "unit" : 10,
             "requests_per_unit" : 3 
         }
     },
@@ -27,7 +27,7 @@
         "title" : "Fixed Window Counter Rate Limit",
         "type" : "fixedWindowCounterRateLimit",
         "rate-limit" : {
-            "unit" : 10000,
+            "unit" : 10,
             "requests_per_unit" : 3 
         }
     },
