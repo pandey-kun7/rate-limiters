@@ -50,6 +50,34 @@ return { 0, 0, retry_after_ms}
 
 `
 
+const SLIDING_WINDOW_COUNTER_LUA_SCRIPT = `
+local curr_key = KEYS[1]
+local prev_key = KEYS[2]
+local max_req = tonumber(ARGV[1])
+local window_seconds = tonumber(ARGV[2])
+local elapsed = tonumber(ARGV[3])
+
+local prev_count = tonumber(redis.call("GET",prev_key) or '0') or 0
+local curr_count = tonumber(redis.call("GET",curr_key) or '0') or 0
+
+local weighted_prev = prev_count * (1 - elapsed)
+local estimated = weighted_prev + curr_count
+
+if estimated >= max_req then
+    return { 0, 0, math.floor(curr_count) }
+end
+
+local new_count = redis.call("INCR", curr_key)
+
+if new_count == 1 then
+    redis.call("EXPIRE", curr_key, window_seconds * 2)
+end
+
+local new_estimate = weighted_prev + new_count
+local remaining = math.max(0, math.floor(max_req - new_estimate))
+
+return { 1 , remaining, new_count }
+`
 
 const RULES = JSON.parse(fs.readFileSync("./rules/rateLimitRules.json","utf-8"));
 
@@ -224,7 +252,7 @@ async function fixedWindowCounterRateLimit(req,res,next){
         //     lastReqTimeStamp = now;
         // }
         
-        if(CURR_REQ_COUNT <= MAX_REQUEST_ALLOWED){
+        if(CURR_REQ_COUNT <= MAX_REQUEST_ALLOWED ){
             res.setHeader('X-Ratelimit-Remaining', `${MAX_REQUEST_ALLOWED - CURR_REQ_COUNT}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_REQUEST_ALLOWED}`);
             next();
@@ -248,64 +276,39 @@ async function fixedWindowCounterRateLimit(req,res,next){
 }
 
 
-let PREV_WINDOW_REQ_COUNT = 0;
-let CURR_WINDOW_REQ_COUNT = 0;
+// let PREV_WINDOW_REQ_COUNT = 0;
+// let CURR_WINDOW_REQ_COUNT = 0;
 const MAX_WINDOW_REQ_ALLOWED = RULES[slidingWindowCounterRateLimitIndex]["rate-limit"]["requests_per_unit"];
 const WINDOW_TIME_LIMIT = RULES[slidingWindowCounterRateLimitIndex]["rate-limit"]["unit"];
 let CURR_REQUEST_LIMIT = 0;
 let OLD_REQ_TIME_STAMP = 0;
 let CURR_REQ_TIME_STAMP = 0;
 
-function slidingWindowCounterRateLimit(req,res,next){
+async function slidingWindowCounterRateLimit(req,res,next){
     try{
-        const now = Date.now();
-        if(CURR_REQ_TIME_STAMP === 0 ){
-            CURR_REQ_TIME_STAMP = now;
-            res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
-            res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
-            CURR_WINDOW_REQ_COUNT++;
-            next();
-            console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m \x1b[32mInitializing window stamp\x1b[0m = \x1b[1m\x1b[33m${CURR_REQ_TIME_STAMP}\x1b[0m \x1b[90m(${new Date(CURR_REQ_TIME_STAMP).toLocaleTimeString()})\x1b[0m`);
-            console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed — current req count : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m`);
-        }else if(CURR_REQ_TIME_STAMP !==0 && now - WINDOW_TIME_LIMIT < CURR_REQ_TIME_STAMP && MAX_WINDOW_REQ_ALLOWED > CURR_WINDOW_REQ_COUNT && OLD_REQ_TIME_STAMP === 0){
-            res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
-            res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
-            CURR_WINDOW_REQ_COUNT++;
-            next();
-            console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed — current req count : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(window stamp\x1b[0m \x1b[33m${CURR_REQ_TIME_STAMP}\x1b[0m\x1b[90m)\x1b[0m`);
-        }else if(now - WINDOW_TIME_LIMIT >= CURR_REQ_TIME_STAMP){
-            PREV_WINDOW_REQ_COUNT = CURR_WINDOW_REQ_COUNT;
-            CURR_WINDOW_REQ_COUNT = 1;
-            OLD_REQ_TIME_STAMP = CURR_REQ_TIME_STAMP;
-            CURR_REQ_TIME_STAMP = now;
-            res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
-            res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
-            next();
-            console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m \x1b[32mRefreshing window stamp...\x1b[0m \x1b[90mold =\x1b[0m \x1b[1m\x1b[33m${OLD_REQ_TIME_STAMP}\x1b[0m \x1b[90m(${new Date(OLD_REQ_TIME_STAMP).toLocaleTimeString()})\x1b[0m \x1b[90m→ new =\x1b[0m \x1b[1m\x1b[33m${CURR_REQ_TIME_STAMP}\x1b[0m \x1b[90m(${new Date(CURR_REQ_TIME_STAMP).toLocaleTimeString()})\x1b[0m`);
-            console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m \x1b[90mPrevious window req count : \x1b[0m\x1b[1m\x1b[33m${PREV_WINDOW_REQ_COUNT}\x1b[0m \x1b[90m| current window req count : \x1b[0m\x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m`);
-        }else if(OLD_REQ_TIME_STAMP!==0){
-            CURR_REQUEST_LIMIT = CURR_WINDOW_REQ_COUNT + Math.floor((PREV_WINDOW_REQ_COUNT * ( 1 -((now - CURR_REQ_TIME_STAMP) / WINDOW_TIME_LIMIT))));
-            if(CURR_REQUEST_LIMIT < MAX_WINDOW_REQ_ALLOWED){
-                const before = CURR_WINDOW_REQ_COUNT;
-                res.setHeader('X-Ratelimit-Remaining', `${MAX_WINDOW_REQ_ALLOWED - CURR_WINDOW_REQ_COUNT}`);
-                res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
-                CURR_WINDOW_REQ_COUNT++;
+        const now = Math.floor(Date.now()/1000);
+        const currWindow = Math.floor(now / WINDOW_TIME_LIMIT);
+        const prevWindow = currWindow - 1;
+        const key = `slidinggWindowCounterRateLimit:${req.ip}:counter`
+        const elapsed = (now % WINDOW_TIME_LIMIT) / WINDOW_TIME_LIMIT;
+
+        const result = await redisClient.eval( SLIDING_WINDOW_COUNTER_LUA_SCRIPT, {
+            keys : [ `{${key}}:${currWindow}` , `{${key}}:${prevWindow}` ],
+            arguments : [ MAX_WINDOW_REQ_ALLOWED.toString() , WINDOW_TIME_LIMIT.toString() , elapsed.toString()  ]
+        })
+
+        console.log(result)
+
+        const REQ_ALLOWED = result[0]
+        const REMAINING_REQ = result[1];
+        const CURR_WINDOW_REQ_COUNT = result[2];
+
+        if(REQ_ALLOWED){
+                res.setHeader('X-Ratelimit-Remaining', `${ REMAINING_REQ }`);
+                res.setHeader('X-Ratelimit-Limit', `${ MAX_WINDOW_REQ_ALLOWED }`);
                 next();
-                console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed — current req limit : \x1b[1m\x1b[33m${CURR_REQUEST_LIMIT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(curr \x1b[0m\x1b[33m${before}\x1b[0m\x1b[90m + prev \x1b[0m\x1b[33m${PREV_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m weighted)\x1b[0m`);
-            }else {
-                if(req.get("Priority") && req.get("Priority") === "1"){
-                    priorityReqQueue.push({req,res,next});
-                    if(!processingPriorityReqQueue){
-                        processPriorityReqQueue();
-                    }
-                    return;
-                }
-                res.setHeader('X-Ratelimit-Retry-After', `${WINDOW_TIME_LIMIT/MAX_WINDOW_REQ_ALLOWED}`);
-                res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
-                console.log(`\x1b[31m[Sliding Window Counter]\x1b[0m Request rejected, weighted limit reached — current req limit : \x1b[1m\x1b[33m${CURR_REQUEST_LIMIT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m`);
-            }
-        }
-        else{
+                console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed —  req limit : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(curr \x1b[0m\x1b[33m\x1b[0m\x1b[90m\x1b[0m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m weighted)\x1b[0m`);
+        }else{
             if(req.get("Priority") && req.get("Priority") === "1"){
                 priorityReqQueue.push({req,res,next});
                 if(!processingPriorityReqQueue){
@@ -313,7 +316,8 @@ function slidingWindowCounterRateLimit(req,res,next){
                 }
                 return;
             }
-            res.setHeader('X-Ratelimit-Retry-After', `${WINDOW_TIME_LIMIT/MAX_WINDOW_REQ_ALLOWED}`);
+            const RETRY_AFTER = Math.max(1, Math.ceil(WINDOW_TIME_LIMIT * ( 1 - elapsed )));
+            res.setHeader('X-Ratelimit-Retry-After', `${ RETRY_AFTER }`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log(`\x1b[31m[Sliding Window Counter]\x1b[0m Request rejected, counter at limit — current req count : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m`);
         }
