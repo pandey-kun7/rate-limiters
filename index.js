@@ -15,6 +15,8 @@ app.use("/",ServeRouter)
 
 export let choice = 0; 
 
+export let leakyBucketMode = "shaping";
+
 const terminalInput = readline.createInterface({
 	input : process.stdin,
 	output : process.stdout,
@@ -37,6 +39,14 @@ app.listen(8000,()=>{
 		}else if(choice === 2){
 			console.log("\n\x1b[1m\x1b[33m>> Sliding Window Log\x1b[0m selected");
 		}else if(choice === 3){
+			terminalInput.question("Press 1 for shaping and Press 2 for policing", (inp)=>{
+				let modeChoice = Number(inp);
+				if(modeChoice === 1){
+					leakyBucketMode = "shaping";
+				}else{
+					leakyBucketMode = "policing";
+				}
+			})
 			console.log("\n\x1b[1m\x1b[33m>> Leaky Bucket\x1b[0m selected");
 		}else if(choice === 4){
 			console.log("\n\x1b[1m\x1b[33m>> Fixed Window Counter\x1b[0m selected");

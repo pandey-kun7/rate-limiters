@@ -19,7 +19,7 @@
         "title" : "Leaky Bucket Rate Limit",
         "type" : "leakyBucketRateLimit",
         "rate-limit" : {
-            "unit" : 3000,
+            "unit" : 10,
             "requests_per_unit" : 3
         }
     },

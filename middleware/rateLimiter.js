@@ -1,6 +1,6 @@
 import path from "path"
 import fs from "fs"
-import {choice} from "../index.js"
+import { choice, leakyBucketMode } from "../index.js"
 import { redisClient } from "../redis/client.js"
 
 const FIXED_WINDOW_LUA_SCRIPT = `
@@ -115,10 +115,89 @@ redis.call("HSET", key, "tokens", tostring(tokens), "last_refill", tostring(now)
 redis.call("EXPIRE", key, math.ceil(max_tokens / refill_rate) + 1)
 
 return {allowed, math.floor(remaining)}
+`
+
+const LEAKY_BUCKET_LUA_POLICING_SCRIPT = `
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local leak_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local data = redis.call("HGETALL", key)
+local level = 0
+local last_leak = now
+
+if #data > 0 then
+    local fields = {}
+    for i = 1, #data , 2 do
+        fields[data[i]] = data[i+1]
+    end
+    level = tonumber(fields["level"]) or  0
+    last_leak = tonumber(fields["last_leak"]) or  now
+end
+
+local elapsed = now - last_leak
+local leaked = elapsed * leak_rate
+level = math.max(0, level - leaked)
+
+local allowed = 0
+local remaining = math.max(0, math.floor(capacity - level))
+
+if level + 1 <= capacity then
+    level = level + 1
+    remaining = math.max(0, math.floor(capacity - level))
+    allowed = 1
+end
+
+redis.call("HSET", key , "level", tostring(level), "last_leak", tostring(now))
+redis.call("EXPIRE", key, math.ceil(capacity / leak_rate) + 1)
+
+return {allowed, remaining}
+`
+const LEAKY_BUCKET_LUA_SHAPING_SCRIPT = `
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local leak_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local data = redis.call("HGETALL", key)
+local next_free = now
+
+if #data > 0 then
+    local fields = {}
+    for i = 1 , #data , 2 do
+        fields[data[i]] = data[i+1]
+    end
+    next_free = tonumber(fields["next_free"]) or now
+end
+
+if next_free < now then
+    next_free = now
+end
+
+local delay = next_free - now
+local queue_depth = delay * leak_rate
+
+local allowed = 0
+local remaining = math.max(0, math.floor(capacity - queue_depth))
+local delay_ms = 0
+
+if queue_depth + 1 <= capacity then
+    queue_depth = queue_depth + 1
+    allowed = 1
+    remaining = math.max(0, math.floor(capacity - queue_depth))
+    delay_ms = math.floor(delay * 1000)
+    next_free = next_free + (1/ leak_rate)
+end
+
+redis.call("HSET", key, "next_free", tostring(next_free))
+redis.call("EXPIRE", key, math.ceil(capacity / leak_rate) + 1)
+
+return {allowed , remaining, delay_ms}
 
 `
 
-const RULES = JSON.parse(fs.readFileSync("./rules/rateLimitRules.json","utf-8"));
+const RULES = JSON.parse(fs.readFileSync("./rules/rateLimitRules.json", "utf-8"));
 
 let lastReqTimeStamp = performance.now();
 
@@ -126,9 +205,9 @@ const priorityReqQueue = [];
 let processingPriorityReqQueue = false;
 
 
-async function processPriorityReqQueue(){
-    const {next,req} = priorityReqQueue.shift();
-    if(req){
+async function processPriorityReqQueue() {
+    const { next, req } = priorityReqQueue.shift();
+    if (req) {
         processingPriorityReqQueue = true;
         console.log("\x1b[90m[Priority]\x1b[0m \x1b[32mReading a queued priority request...\x1b[0m");
         next();
@@ -146,17 +225,17 @@ const BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["rate-limit"]["requests_per
 const RATE_FILL = RULES[tokenBucketRateLimitIndex]["rate-limit"]["unit"];
 let CURR_BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["rate-limit"]["requests_per_unit"];
 
-async function tokenBucketRateLimit(req,res,next){
-    try{
+async function tokenBucketRateLimit(req, res, next) {
+    try {
         const now = Date.now() / 1000;
         // const throughput = RATE_FILL/BUCKET_SIZE;
 
         const key = `tokenBucketRateLimit:${req.ip}`
 
-        const result = await redisClient.eval( TOKEN_BUCKET_LUA_SCRIPT , {
+        const result = await redisClient.eval(TOKEN_BUCKET_LUA_SCRIPT, {
             keys: [key],
-            arguments : [ BUCKET_SIZE.toString(), (BUCKET_SIZE/RATE_FILL).toString(), now.toString() ]
-        }) 
+            arguments: [BUCKET_SIZE.toString(), (BUCKET_SIZE / RATE_FILL).toString(), now.toString()]
+        })
 
         const allowed = result[0];
         const REMAINING_REQUESTS = result[1];
@@ -167,27 +246,27 @@ async function tokenBucketRateLimit(req,res,next){
         // lastReqTimeStamp = now;
         // console.log("\x1b[90m[Token Bucket]\x1b[0m \x1b[32mAdded token...\x1b[0m new size : \x1b[1m"+CURR_BUCKET_SIZE+"\x1b[0m");
 
-        if(allowed === 1){
+        if (allowed === 1) {
 
             res.setHeader('X-Ratelimit-Remaining', `${REMAINING_REQUESTS}`);
             res.setHeader('X-Ratelimit-Limit', `${BUCKET_SIZE}`);
             next();
 
-            console.log(`\x1b[90m[Token Bucket]\x1b[0m Remaining tokens : \x1b[1m\x1b[33m${BUCKET_SIZE-REMAINING_REQUESTS}\x1b[0m\x1b[90m / ${BUCKET_SIZE}\x1b[0m`);
-        }else{
-            if(req.get("Priority") && req.get("Priority") === "1"){
+            console.log(`\x1b[90m[Token Bucket]\x1b[0m Remaining tokens : \x1b[1m\x1b[33m${BUCKET_SIZE - REMAINING_REQUESTS}\x1b[0m\x1b[90m / ${BUCKET_SIZE}\x1b[0m`);
+        } else {
+            if (req.get("Priority") && req.get("Priority") === "1") {
                 console.log("Priority req added in queue")
-                priorityReqQueue.push({req,res,next});
-                if(!processingPriorityReqQueue){
+                priorityReqQueue.push({ req, res, next });
+                if (!processingPriorityReqQueue) {
                     processPriorityReqQueue();
                 }
                 return;
             }
-            res.setHeader('X-Ratelimit-Retry-After', `${ RATE_FILL }`);
+            res.setHeader('X-Ratelimit-Retry-After', `${RATE_FILL}`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log("\x1b[31m[Token Bucket]\x1b[0m Request rejected, bucket is empty");
         }
-    }catch(err){
+    } catch (err) {
         console.log(`\x1b[31m[Token Bucket]\x1b[0m Error : ${err}`);
     }
 }
@@ -197,20 +276,20 @@ const SLIDING_WINDOW_LENGTH = RULES[slidingWindowLogRateLimitIndex]["rate-limit"
 const MAX_REQ_ALLOWED = RULES[slidingWindowLogRateLimitIndex]["rate-limit"]["requests_per_unit"];
 let REQUEST_TIME_STAMPS = [];
 
-function clear(timeStamp){
+function clear(timeStamp) {
     let staleTimeLimit = timeStamp - SLIDING_WINDOW_LENGTH;
-    REQUEST_TIME_STAMPS = REQUEST_TIME_STAMPS.filter((ts)=> (ts > staleTimeLimit));
+    REQUEST_TIME_STAMPS = REQUEST_TIME_STAMPS.filter((ts) => (ts > staleTimeLimit));
     console.log(`\x1b[90m[Sliding Window]\x1b[0m \x1b[1m${REQUEST_TIME_STAMPS.length}\x1b[0m request(s) within the current window`);
 }
 
-async function slidingWindowLogRateLimit(req,res,next){
-    try{
+async function slidingWindowLogRateLimit(req, res, next) {
+    try {
         const now = Date.now();
         const member = `${now}:${Math.random()}`;
 
-        const result = (await redisClient.eval(SLIDING_WINDOW_LOG_LUA_SCRIPT , {
+        const result = (await redisClient.eval(SLIDING_WINDOW_LOG_LUA_SCRIPT, {
             keys: [`slidingWindowLogRateLimit:${req.ip}:counter`],
-            arguments : [
+            arguments: [
                 MAX_REQ_ALLOWED.toString(),
                 SLIDING_WINDOW_LENGTH.toString(),
                 now.toString(),
@@ -223,16 +302,16 @@ async function slidingWindowLogRateLimit(req,res,next){
         const REMAINING_REQ = result[1];
         const RETRY_AFTER = result[2];
 
-        if(count < MAX_REQ_ALLOWED && count !== 0){
+        if (count < MAX_REQ_ALLOWED && count !== 0) {
             // REQUEST_TIME_STAMPS.push(now);
             res.setHeader('X-Ratelimit-Remaining', `${REMAINING_REQ}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_REQ_ALLOWED}`);
             next();
             console.log(`\x1b[90m[Sliding Window]\x1b[0m Request allowed (\x1b[1m${count}\x1b[0m/\x1b[1m${MAX_REQ_ALLOWED}\x1b[0m)`);
-        }else{
-            if(req.get("Priority") && req.get("Priority") === "1"){
-                priorityReqQueue.push({req,res,next});
-                if(!processingPriorityReqQueue){
+        } else {
+            if (req.get("Priority") && req.get("Priority") === "1") {
+                priorityReqQueue.push({ req, res, next });
+                if (!processingPriorityReqQueue) {
                     processPriorityReqQueue();
                 }
                 return;
@@ -241,7 +320,7 @@ async function slidingWindowLogRateLimit(req,res,next){
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log("\x1b[31m[Sliding Window]\x1b[0m Request rejected, window full");
         }
-    }catch(err){
+    } catch (err) {
         console.log(`\x1b[31m[Sliding Window]\x1b[0m Error : ${err}`);
     }
 }
@@ -251,25 +330,50 @@ let BUCKET = [];
 const LEAKY_BUCKET_SIZE = RULES[leakyBucketRateLimitIndex]["rate-limit"]['requests_per_unit'];
 const REFILL_TIME = RULES[leakyBucketRateLimitIndex]["rate-limit"]['unit']
 
-function leakyBucketRateLimit(req,res,next){
-    try{
-        console.log(BUCKET.length ," ", LEAKY_BUCKET_SIZE)
-        if(BUCKET.length < LEAKY_BUCKET_SIZE){
-            BUCKET.push({req,res,next});
-            console.log(`\x1b[90m[Leaky Bucket]\x1b[0m Request queued (\x1b[1m${BUCKET.length}\x1b[0m/\x1b[1m${LEAKY_BUCKET_SIZE}\x1b[0m)`);
-        }else{
-            if(req.get("Priority") && req.get("Priority") === "1"){
-                priorityReqQueue.push({req,res,next});
-                if(!processingPriorityReqQueue){
+async function leakyBucketRateLimit(req, res, next, mode) {
+    try {
+        console.log(mode);
+        const LEAKY_BUCKET_LUA_SCRIPT = mode === "shaping" ? LEAKY_BUCKET_LUA_SHAPING_SCRIPT : LEAKY_BUCKET_LUA_POLICING_SCRIPT;
+        const key = `leakyBucketteLimit:${req.ip}:counter`;
+        const now = Date.now()/1000;
+
+        const result = await redisClient.eval(LEAKY_BUCKET_LUA_SCRIPT, {
+            keys: [key],
+            arguments: [ LEAKY_BUCKET_SIZE.toString() , (LEAKY_BUCKET_SIZE / REFILL_TIME).toString(), now.toString() ]
+        })
+
+        console.log(result)
+
+        const allowed = result[0];
+        const REMAINING_REQUESTS = result[1];
+        const delay_ms = result[2] || 0;
+
+        if (allowed!==0) {
+            res.setHeader('X-Ratelimit-Remaining', `${REMAINING_REQUESTS}`);
+            res.setHeader('X-Ratelimit-Limit', `${LEAKY_BUCKET_SIZE}`);
+            if(delay_ms!==0){
+                setTimeout(()=>{
+                    next();
+                    console.log("\x1b[90m[Leaky Bucket]\x1b[0m \x1b[32mReading a queued request...\x1b[0m remaining : \x1b[1m" + LEAKY_BUCKET_SIZE - REMAINING_REQUESTS + "\x1b[0m");
+
+                },delay_ms)
+            }else{
+                next();
+            }
+            console.log(`\x1b[90m[Leaky Bucket]\x1b[0m Request queued (\x1b[1m${LEAKY_BUCKET_SIZE - REMAINING_REQUESTS}\x1b[0m/\x1b[1m${LEAKY_BUCKET_SIZE}\x1b[0m)`);
+        } else {
+            if (req.get("Priority") && req.get("Priority") === "1") {
+                priorityReqQueue.push({ req, res, next });
+                if (!processingPriorityReqQueue) {
                     processPriorityReqQueue();
                 }
                 return;
             }
-            res.setHeader('X-Ratelimit-Retry-After', `${REFILL_TIME/LEAKY_BUCKET_SIZE}`);
+            res.setHeader('X-Ratelimit-Retry-After', `${REFILL_TIME / LEAKY_BUCKET_SIZE}`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log("\x1b[31m[Leaky Bucket]\x1b[0m Request rejected, bucket full");
         }
-    }catch(err){
+    } catch (err) {
         console.log(`\x1b[31m[Leaky Bucket]\x1b[0m Error : ${err}`);
     }
 }
@@ -279,14 +383,14 @@ const MAX_REQUEST_ALLOWED = RULES[fixedWindowCounterRateLimitIndex]["rate-limit"
 const FIXED_WINDOW_TIME_LIMIT = RULES[fixedWindowCounterRateLimitIndex]["rate-limit"]["unit"];
 let CURR_REQ_COUNT = 0;
 
-async function fixedWindowCounterRateLimit(req,res,next){
-    try{
+async function fixedWindowCounterRateLimit(req, res, next) {
+    try {
 
-        const result = (await redisClient.eval(FIXED_WINDOW_LUA_SCRIPT,{
+        const result = (await redisClient.eval(FIXED_WINDOW_LUA_SCRIPT, {
             keys: [`fixedWindowCounterRateLimit:${req.ip}:counter`],
-            arguments: [ MAX_REQUEST_ALLOWED.toString() , FIXED_WINDOW_TIME_LIMIT.toString() ]
+            arguments: [MAX_REQUEST_ALLOWED.toString(), FIXED_WINDOW_TIME_LIMIT.toString()]
         }))
-        
+
 
         CURR_REQ_COUNT = await result[0];
 
@@ -297,30 +401,30 @@ async function fixedWindowCounterRateLimit(req,res,next){
         // if(isWindowExpired) CURR_REQ_COUNT = 0;
 
         console.log("\x1b[90m[Fixed Window]\x1b[0m \x1b[32mRefreshing window...\x1b[0m counter reset");
-        
+
         // if(CURR_REQ_COUNT === 0){
         //     lastReqTimeStamp = now;
         // }
-        
-        if(CURR_REQ_COUNT <= MAX_REQUEST_ALLOWED ){
+
+        if (CURR_REQ_COUNT <= MAX_REQUEST_ALLOWED) {
             res.setHeader('X-Ratelimit-Remaining', `${MAX_REQUEST_ALLOWED - CURR_REQ_COUNT}`);
             res.setHeader('X-Ratelimit-Limit', `${MAX_REQUEST_ALLOWED}`);
             next();
             console.log(`\x1b[90m[Fixed Window]\x1b[0m Request allowed (\x1b[1m${CURR_REQ_COUNT}\x1b[0m/\x1b[1m${MAX_REQUEST_ALLOWED}\x1b[0m)`);
-        }else{
-            if(req.get("Priority") && req.get("Priority") === "1"){
-                priorityReqQueue.push({req,res,next});
-                if(!processingPriorityReqQueue){
+        } else {
+            if (req.get("Priority") && req.get("Priority") === "1") {
+                priorityReqQueue.push({ req, res, next });
+                if (!processingPriorityReqQueue) {
                     processPriorityReqQueue();
                 }
                 return;
             }
-            res.setHeader('X-Ratelimit-Retry-After', `${ RETRY_AFTER }`);
+            res.setHeader('X-Ratelimit-Retry-After', `${RETRY_AFTER}`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log("\x1b[31m[Fixed Window]\x1b[0m Request rejected, counter at limit");
         }
 
-    }catch(err){
+    } catch (err) {
         console.log(`\x1b[31m[Fixed Window]\x1b[0m Error : ${err}`);
     }
 }
@@ -334,17 +438,17 @@ let CURR_REQUEST_LIMIT = 0;
 let OLD_REQ_TIME_STAMP = 0;
 let CURR_REQ_TIME_STAMP = 0;
 
-async function slidingWindowCounterRateLimit(req,res,next){
-    try{
-        const now = Math.floor(Date.now()/1000);
+async function slidingWindowCounterRateLimit(req, res, next) {
+    try {
+        const now = Math.floor(Date.now() / 1000);
         const currWindow = Math.floor(now / WINDOW_TIME_LIMIT);
         const prevWindow = currWindow - 1;
         const key = `slidingWindowCounterRateLimit:${req.ip}:counter`
         const elapsed = (now % WINDOW_TIME_LIMIT) / WINDOW_TIME_LIMIT;
 
-        const result = await redisClient.eval( SLIDING_WINDOW_COUNTER_LUA_SCRIPT, {
-            keys : [ `{${key}}:${currWindow}` , `{${key}}:${prevWindow}` ],
-            arguments : [ MAX_WINDOW_REQ_ALLOWED.toString() , WINDOW_TIME_LIMIT.toString() , elapsed.toString()  ]
+        const result = await redisClient.eval(SLIDING_WINDOW_COUNTER_LUA_SCRIPT, {
+            keys: [`{${key}}:${currWindow}`, `{${key}}:${prevWindow}`],
+            arguments: [MAX_WINDOW_REQ_ALLOWED.toString(), WINDOW_TIME_LIMIT.toString(), elapsed.toString()]
         })
 
         console.log(result)
@@ -353,53 +457,42 @@ async function slidingWindowCounterRateLimit(req,res,next){
         const REMAINING_REQ = result[1];
         const CURR_WINDOW_REQ_COUNT = result[2];
 
-        if(REQ_ALLOWED){
-                res.setHeader('X-Ratelimit-Remaining', `${ REMAINING_REQ }`);
-                res.setHeader('X-Ratelimit-Limit', `${ MAX_WINDOW_REQ_ALLOWED }`);
-                next();
-                console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed —  req limit : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(curr \x1b[0m\x1b[33m\x1b[0m\x1b[90m\x1b[0m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m weighted)\x1b[0m`);
-        }else{
-            if(req.get("Priority") && req.get("Priority") === "1"){
-                priorityReqQueue.push({req,res,next});
-                if(!processingPriorityReqQueue){
+        if (REQ_ALLOWED) {
+            res.setHeader('X-Ratelimit-Remaining', `${REMAINING_REQ}`);
+            res.setHeader('X-Ratelimit-Limit', `${MAX_WINDOW_REQ_ALLOWED}`);
+            next();
+            console.log(`\x1b[90m[Sliding Window Counter]\x1b[0m Request allowed —  req limit : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m \x1b[90m(curr \x1b[0m\x1b[33m\x1b[0m\x1b[90m\x1b[0m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m weighted)\x1b[0m`);
+        } else {
+            if (req.get("Priority") && req.get("Priority") === "1") {
+                priorityReqQueue.push({ req, res, next });
+                if (!processingPriorityReqQueue) {
                     processPriorityReqQueue();
                 }
                 return;
             }
-            const RETRY_AFTER = Math.max(1, Math.ceil(WINDOW_TIME_LIMIT * ( 1 - elapsed )));
-            res.setHeader('X-Ratelimit-Retry-After', `${ RETRY_AFTER }`);
+            const RETRY_AFTER = Math.max(1, Math.ceil(WINDOW_TIME_LIMIT * (1 - elapsed)));
+            res.setHeader('X-Ratelimit-Retry-After', `${RETRY_AFTER}`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log(`\x1b[31m[Sliding Window Counter]\x1b[0m Request rejected, counter at limit — current req count : \x1b[1m\x1b[33m${CURR_WINDOW_REQ_COUNT}\x1b[0m\x1b[90m/\x1b[0m\x1b[1m\x1b[33m${MAX_WINDOW_REQ_ALLOWED}\x1b[0m`);
         }
-    }catch(err){
+    } catch (err) {
         console.log(`\x1b[31m[Sliding Window Counter]\x1b[0m Error : ${err}`);
     }
 }
 
-setInterval(()=>{
-    if(choice === 3 && BUCKET.length > 0){
-        const {next, res} = BUCKET.shift();
-        res.setHeader('X-Ratelimit-Remaining', `${LEAKY_BUCKET_SIZE - BUCKET.length}`);
-        res.setHeader('X-Ratelimit-Limit', `${LEAKY_BUCKET_SIZE}`);
-        next();
-        console.log("\x1b[90m[Leaky Bucket]\x1b[0m \x1b[32mReading a queued request...\x1b[0m remaining : \x1b[1m"+BUCKET.length+"\x1b[0m");
-    }
-    
-},RATE_FILL)
 
-
-export const rateLimiter = (req,res,next)=>{
-    if(choice === 1){
-        tokenBucketRateLimit(req,res,next);
-    }else if(choice === 2){
-        slidingWindowLogRateLimit(req,res,next);
-    }else if(choice === 3){
-        leakyBucketRateLimit(req,res,next);
-    }else if(choice === 4){
-        fixedWindowCounterRateLimit(req,res,next);
-    }else if(choice === 5){
-        slidingWindowCounterRateLimit(req,res,next);
-    }else{
+export const rateLimiter = (req, res, next) => {
+    if (choice === 1) {
+        tokenBucketRateLimit(req, res, next);
+    } else if (choice === 2) {
+        slidingWindowLogRateLimit(req, res, next);
+    } else if (choice === 3) {
+        leakyBucketRateLimit(req, res, next, leakyBucketMode);
+    } else if (choice === 4) {
+        fixedWindowCounterRateLimit(req, res, next);
+    } else if (choice === 5) {
+        slidingWindowCounterRateLimit(req, res, next);
+    } else {
         next();
     }
 }
