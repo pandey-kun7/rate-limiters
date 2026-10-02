@@ -36,30 +36,33 @@ app.listen(8000,()=>{
 
 		if(choice === 1){
 			console.log("\n\x1b[1m\x1b[33m>> Token Bucket\x1b[0m selected");
+			askChoiceForRateLimit();
 		}else if(choice === 2){
 			console.log("\n\x1b[1m\x1b[33m>> Sliding Window Log\x1b[0m selected");
+			askChoiceForRateLimit();
 		}else if(choice === 3){
-			terminalInput.question("Press 1 for shaping and Press 2 for policing", (inp)=>{
+			terminalInput.question("Press 1 for shaping or anything for policing\n", (inp)=>{
 				let modeChoice = Number(inp);
 				if(modeChoice === 1){
 					leakyBucketMode = "shaping";
 				}else{
 					leakyBucketMode = "policing";
 				}
+				askChoiceForRateLimit();
 			})
 			console.log("\n\x1b[1m\x1b[33m>> Leaky Bucket\x1b[0m selected");
 		}else if(choice === 4){
 			console.log("\n\x1b[1m\x1b[33m>> Fixed Window Counter\x1b[0m selected");
+			askChoiceForRateLimit();
 		}else if(choice === 5){
 			console.log("\n\x1b[1m\x1b[33m>> Sliding Window Counter\x1b[0m selected");
+			askChoiceForRateLimit();
 		}else{
+			askChoiceForRateLimit();
 			console.log("\n\x1b[31m[!]\x1b[0m No rate limiter selected, requests will pass through");
-		}
-
-		askChoiceForRateLimit();
-
-		})
+			askChoiceForRateLimit();
+		}		
+	})
 	}
-
 	askChoiceForRateLimit();
 })
