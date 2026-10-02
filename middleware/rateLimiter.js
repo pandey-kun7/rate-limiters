@@ -79,6 +79,45 @@ local remaining = math.max(0, math.floor(max_req - new_estimate))
 return { 1 , remaining, new_count }
 `
 
+const TOKEN_BUCKET_LUA_SCRIPT = `
+local key = KEYS[1]
+local max_tokens = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local data = redis.call("HGETALL", key)
+local tokens = max_tokens
+local last_refill = now
+
+if #data > 0 then
+    local fields = {}
+    for i = 1 , #data, 2 do
+        fields[data[i]] = data[i+1]
+    end
+    tokens = tonumber(fields['tokens']) or max_tokens
+    last_refill = tonumber(fields['last_refill']) or now
+end
+
+local elapsed = now - last_refill
+local new_tokens = elapsed * refill_rate
+tokens = math.min(max_tokens, tokens + new_tokens)
+
+local allowed = 0
+local remaining = tokens
+
+if tokens >= 1 then
+    tokens = tokens - 1
+    remaining = tokens
+    allowed = 1
+end
+
+redis.call("HSET", key, "tokens", tostring(tokens), "last_refill", tostring(now))
+redis.call("EXPIRE", key, math.ceil(max_tokens / refill_rate) + 1)
+
+return {allowed, math.floor(remaining)}
+
+`
+
 const RULES = JSON.parse(fs.readFileSync("./rules/rateLimitRules.json","utf-8"));
 
 let lastReqTimeStamp = performance.now();
@@ -107,23 +146,34 @@ const BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["rate-limit"]["requests_per
 const RATE_FILL = RULES[tokenBucketRateLimitIndex]["rate-limit"]["unit"];
 let CURR_BUCKET_SIZE = RULES[tokenBucketRateLimitIndex]["rate-limit"]["requests_per_unit"];
 
-function tokenBucketRateLimit(req,res,next){
+async function tokenBucketRateLimit(req,res,next){
     try{
-        const now = performance.now();
-        const throughput = RATE_FILL/BUCKET_SIZE;
-        CURR_BUCKET_SIZE = Math.floor((now - lastReqTimeStamp)/throughput);
-        lastReqTimeStamp = now;
-        console.log("\x1b[90m[Token Bucket]\x1b[0m \x1b[32mAdded token...\x1b[0m new size : \x1b[1m"+CURR_BUCKET_SIZE+"\x1b[0m");
+        const now = Date.now() / 1000;
+        // const throughput = RATE_FILL/BUCKET_SIZE;
 
-        if(CURR_BUCKET_SIZE > 0){
+        const key = `tokenBucketRateLimit:${req.ip}`
 
-            res.setHeader('X-Ratelimit-Remaining', `${CURR_BUCKET_SIZE}`);
+        const result = await redisClient.eval( TOKEN_BUCKET_LUA_SCRIPT , {
+            keys: [key],
+            arguments : [ BUCKET_SIZE.toString(), (BUCKET_SIZE/RATE_FILL).toString(), now.toString() ]
+        }) 
+
+        const allowed = result[0];
+        const REMAINING_REQUESTS = result[1];
+
+        console.log(result, (new Date()).toLocaleTimeString());
+
+        // CURR_BUCKET_SIZE = Math.floor((now - lastReqTimeStamp)/throughput);
+        // lastReqTimeStamp = now;
+        // console.log("\x1b[90m[Token Bucket]\x1b[0m \x1b[32mAdded token...\x1b[0m new size : \x1b[1m"+CURR_BUCKET_SIZE+"\x1b[0m");
+
+        if(allowed === 1){
+
+            res.setHeader('X-Ratelimit-Remaining', `${REMAINING_REQUESTS}`);
             res.setHeader('X-Ratelimit-Limit', `${BUCKET_SIZE}`);
-            CURR_BUCKET_SIZE--;
-
             next();
 
-            console.log(`\x1b[90m[Token Bucket]\x1b[0m Remaining tokens : \x1b[1m\x1b[33m${CURR_BUCKET_SIZE}\x1b[0m\x1b[90m / ${BUCKET_SIZE}\x1b[0m`);
+            console.log(`\x1b[90m[Token Bucket]\x1b[0m Remaining tokens : \x1b[1m\x1b[33m${BUCKET_SIZE-REMAINING_REQUESTS}\x1b[0m\x1b[90m / ${BUCKET_SIZE}\x1b[0m`);
         }else{
             if(req.get("Priority") && req.get("Priority") === "1"){
                 console.log("Priority req added in queue")
@@ -133,7 +183,7 @@ function tokenBucketRateLimit(req,res,next){
                 }
                 return;
             }
-            res.setHeader('X-Ratelimit-Retry-After', `${RATE_FILL/BUCKET_SIZE}`);
+            res.setHeader('X-Ratelimit-Retry-After', `${ RATE_FILL }`);
             res.status(429).sendFile(path.resolve("./public/err/rate-limited.html"));
             console.log("\x1b[31m[Token Bucket]\x1b[0m Request rejected, bucket is empty");
         }
@@ -289,7 +339,7 @@ async function slidingWindowCounterRateLimit(req,res,next){
         const now = Math.floor(Date.now()/1000);
         const currWindow = Math.floor(now / WINDOW_TIME_LIMIT);
         const prevWindow = currWindow - 1;
-        const key = `slidinggWindowCounterRateLimit:${req.ip}:counter`
+        const key = `slidingWindowCounterRateLimit:${req.ip}:counter`
         const elapsed = (now % WINDOW_TIME_LIMIT) / WINDOW_TIME_LIMIT;
 
         const result = await redisClient.eval( SLIDING_WINDOW_COUNTER_LUA_SCRIPT, {

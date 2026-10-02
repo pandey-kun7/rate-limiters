@@ -3,7 +3,7 @@
         "title" : "Token Bucket Rate Limit",
         "type" : "tokenBucketRateLimit",
         "rate-limit" : {
-            "unit" : 10000,
+            "unit" : 10,
             "requests_per_unit" : 3 
         }
     },
